@@ -257,8 +257,12 @@ app.all('*', async (c) => {
   const probeGateway = async (timeoutMs: number): Promise<boolean> => {
     try {
       const url = `http://localhost:${MOLTBOT_PORT}/`;
+      const fetchPromise = sandbox.containerFetch(new Request(url), MOLTBOT_PORT);
+      // Suppress unhandled rejection: if the timeout rejects first, the still-running
+      // containerFetch will later reject and become an unhandled rejection without this.
+      fetchPromise.catch(() => {});
       const resp = await Promise.race([
-        sandbox.containerFetch(new Request(url), MOLTBOT_PORT),
+        fetchPromise,
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error('probe timeout')), timeoutMs),
         ),
@@ -300,20 +304,37 @@ app.all('*', async (c) => {
     return c.html(loadingPageHtml);
   }
 
-  // Ensure moltbot is running (this will wait for startup)
+  // Ensure moltbot is running (this will wait for startup).
+  // IMPORTANT: If the gateway was already confirmed reachable via probeGateway above,
+  // skip this entirely — ensureMoltbotGateway's internal waitForPort can block for up
+  // to STARTUP_TIMEOUT_MS (3 min) even when the gateway is already up, causing hangs.
+  // If not ready, apply a hard 25s cap so the Worker never gets killed for hanging.
+  const ENSURE_TIMEOUT_MS = 25_000;
   try {
-    await ensureMoltbotGateway(sandbox, c.env);
+    if (!isGatewayReady) {
+      await Promise.race([
+        ensureMoltbotGateway(sandbox, c.env),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Gateway startup timed out after 25s')),
+            ENSURE_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+    }
   } catch (error) {
     console.error('[PROXY] Failed to start Moltbot:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
     // If this is a browser navigation and the failure is transient (common right after deploy
-    // when the DO is reset), serve the loading page so the UI can recover on its own.
+    // when the DO is reset, or when startup is still in progress), serve the loading page
+    // so the UI can recover on its own.
     if (
       acceptsHtml &&
       (errorMessage.includes('Durable Object reset because its code was updated') ||
         errorMessage.includes('Network connection lost') ||
-        errorMessage.toLowerCase().includes('connection lost'))
+        errorMessage.toLowerCase().includes('connection lost') ||
+        errorMessage.includes('Gateway startup timed out'))
     ) {
       c.executionCtx.waitUntil(kickMoltbotGateway(sandbox, c.env));
       return c.html(loadingPageHtml, 503);
@@ -507,8 +528,12 @@ app.all('*', async (c) => {
   const PROXY_TIMEOUT_MS = 30_000;
   let httpResponse: Response;
   try {
+    const proxyFetch = sandbox.containerFetch(httpRequest, MOLTBOT_PORT);
+    // Suppress unhandled rejection: if the timeout fires first, the still-running
+    // containerFetch would otherwise produce an unhandled rejection later.
+    proxyFetch.catch(() => {});
     httpResponse = await Promise.race([
-      sandbox.containerFetch(httpRequest, MOLTBOT_PORT),
+      proxyFetch,
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error('Gateway did not respond within ' + PROXY_TIMEOUT_MS / 1000 + 's')), PROXY_TIMEOUT_MS),
       ),
@@ -547,20 +572,25 @@ export default {
           const sandbox = getSandbox(env.Sandbox, 'moltbot', options);
 
           // If the gateway isn't reachable, kick startup. Keep it fast/bounded.
-          const url = `http://localhost:${MOLTBOT_PORT}/`;
-          const ok = await Promise.race([
-            sandbox.containerFetch(
-              new Request(
-                env.MOLTBOT_GATEWAY_TOKEN
-                  ? url + `?token=${encodeURIComponent(env.MOLTBOT_GATEWAY_TOKEN)}`
-                  : url,
-              ),
-              MOLTBOT_PORT,
+          const probeUrl = `http://localhost:${MOLTBOT_PORT}/`;
+          const probeFetch = sandbox.containerFetch(
+            new Request(
+              env.MOLTBOT_GATEWAY_TOKEN
+                ? probeUrl + `?token=${encodeURIComponent(env.MOLTBOT_GATEWAY_TOKEN)}`
+                : probeUrl,
             ),
+            MOLTBOT_PORT,
+          );
+          // Suppress unhandled rejection: if the timeout wins, the in-flight
+          // containerFetch will later reject and must not become an unhandled rejection
+          // (Cloudflare surfaces those as "Exception Thrown" from the alarm handler).
+          probeFetch.catch(() => {});
+          const gatewayOk = await Promise.race([
+            probeFetch.then(() => true).catch(() => false),
             new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1200)),
           ]);
 
-          if (!ok) {
+          if (!gatewayOk) {
             console.warn('[CRON] Gateway probe failed; kicking startup');
             await kickMoltbotGateway(sandbox, env);
           }

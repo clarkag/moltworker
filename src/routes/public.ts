@@ -41,8 +41,12 @@ publicRoutes.get('/api/status', async (c) => {
     // to show "Starting container..." forever even when the gateway is up.
     try {
       const url = `http://localhost:${PORT}/`;
+      const fetchPromise = sandbox.containerFetch(new Request(url), PORT);
+      // Suppress unhandled rejection: if the timeout rejects first, the still-running
+      // containerFetch will later reject and must not become an unhandled rejection.
+      fetchPromise.catch(() => {});
       const resp = await Promise.race([
-        sandbox.containerFetch(new Request(url), PORT),
+        fetchPromise,
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error('probe timeout')), timeoutMs),
         ),

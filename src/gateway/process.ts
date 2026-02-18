@@ -5,6 +5,10 @@ import { buildEnvVars } from './env';
 import { ensureRcloneConfig } from './r2';
 
 function withTimeout<T>(label: string, p: Promise<T>, timeoutMs: number): Promise<T> {
+  // Attach a no-op rejection handler so that if the timeout wins the race first,
+  // p's eventual rejection doesn't become an unhandled promise rejection (which
+  // Cloudflare Workers surface as "Exception Thrown" in wrangler logs).
+  p.catch(() => {});
   return Promise.race([
     p,
     new Promise<T>((_, reject) =>
@@ -215,7 +219,9 @@ export async function kickMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): Pro
       sandbox.startProcess(command, {
         env: Object.keys(envVars).length > 0 ? envVars : undefined,
       }),
-      5000,
+      // 15s: startProcess can take 10-15s on a freshly-reset container.
+      // Too short a timeout causes the process to never get kicked.
+      15000,
     );
   } catch (e) {
     // Swallow errors: callers use this for best-effort boot kicking.
