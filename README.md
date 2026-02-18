@@ -347,6 +347,14 @@ node /root/clawd/skills/cloudflare-browser/scripts/video.js "https://site1.com,h
 
 See `skills/cloudflare-browser/SKILL.md` for full documentation.
 
+### Blocked / disabled skills
+
+Skills that require system binaries (e.g. **obsidian** needs `obsidian-cli` via Homebrew) are disabled in config, since the sandbox container has no Homebrew or those tools. You can re-enable them in `openclaw.json` under `skills.entries.<name>.enabled` if you add the required binaries to the image.
+
+### Extra skills from ClawHub
+
+On startup, the container optionally installs these skills from [ClawHub](https://clawhub.ai) if not already present: `resilient-coding-agent`, `openclaw-github-assistant`, `openai-whisper-api`, `voice-wake-say`. To add more, run inside the container (e.g. via `/debug/cli`): `clawhub install <slug> --no-input --force` from `/root/clawd`, or add the slug to the `for slug in ...` list in `start-openclaw.sh` and rebuild.
+
 ## Optional: Cloudflare AI Gateway
 
 You can route API requests through [Cloudflare AI Gateway](https://developers.cloudflare.com/ai-gateway/) for caching, rate limiting, analytics, and cost tracking. OpenClaw has native support for Cloudflare AI Gateway as a first-class provider.
@@ -419,6 +427,7 @@ The previous `AI_GATEWAY_API_KEY` + `AI_GATEWAY_BASE_URL` approach is still supp
 | `ANTHROPIC_API_KEY` | Yes* | Direct Anthropic API key (alternative to AI Gateway) |
 | `ANTHROPIC_BASE_URL` | No | Direct Anthropic API base URL |
 | `OPENAI_API_KEY` | No | OpenAI API key (alternative provider) |
+| `OPENROUTER_API_KEY` | No | [OpenRouter](https://docs.openclaw.ai/providers/openrouter) API key; default model Claude Sonnet 4.5 |
 | `AI_GATEWAY_API_KEY` | No | Legacy AI Gateway API key (deprecated, use `CLOUDFLARE_AI_GATEWAY_API_KEY` instead) |
 | `AI_GATEWAY_BASE_URL` | No | Legacy AI Gateway endpoint URL (deprecated) |
 | `CF_ACCESS_TEAM_DOMAIN` | Yes* | Cloudflare Access team domain (required for admin UI) |

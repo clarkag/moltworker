@@ -9,6 +9,12 @@
 
 set -e
 
+# OpenClaw requires Node 22+. We install it side-by-side in the image and invoke
+# binaries explicitly so we don't interfere with the sandbox base image runtime.
+OPENCLAW_BIN="/opt/node22/bin/openclaw"
+CLAWHUB_BIN="/opt/node22/bin/clawhub"
+export PATH="/opt/node22/bin:$PATH"
+
 if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
     echo "OpenClaw gateway is already running, exiting."
     exit 0
@@ -112,11 +118,13 @@ if [ ! -f "$CONFIG_FILE" ]; then
             --cloudflare-ai-gateway-api-key $CLOUDFLARE_AI_GATEWAY_API_KEY"
     elif [ -n "$ANTHROPIC_API_KEY" ]; then
         AUTH_ARGS="--auth-choice apiKey --anthropic-api-key $ANTHROPIC_API_KEY"
+    elif [ -n "$OPENROUTER_API_KEY" ]; then
+        AUTH_ARGS="--auth-choice apiKey --token-provider openrouter --token $OPENROUTER_API_KEY"
     elif [ -n "$OPENAI_API_KEY" ]; then
         AUTH_ARGS="--auth-choice openai-api-key --openai-api-key $OPENAI_API_KEY"
     fi
 
-    openclaw onboard --non-interactive --accept-risk \
+    "$OPENCLAW_BIN" onboard --non-interactive --accept-risk \
         --mode local \
         $AUTH_ARGS \
         --gateway-port 18789 \
@@ -131,14 +139,9 @@ else
 fi
 
 # ============================================================
-# PATCH CONFIG (channels, gateway auth, trusted proxies)
+# PATCH CONFIG (channels, gateway auth, trusted proxies, OpenRouter)
 # ============================================================
-# openclaw onboard handles provider/model config, but we need to patch in:
-# - Channel config (Telegram, Discord, Slack)
-# - Gateway token auth
-# - Trusted proxies for sandbox networking
-# - Base URL override for legacy AI Gateway path
-node << 'EOFPATCH'
+node <<'EOFPATCH'
 const fs = require('fs');
 
 const configPath = '/root/.openclaw/openclaw.json';
@@ -219,15 +222,51 @@ if (process.env.CF_AI_GATEWAY_MODEL) {
     }
 }
 
+// Anthropic configuration (primary when ANTHROPIC_API_KEY is set)
+if (process.env.ANTHROPIC_API_KEY) {
+    config.env = config.env || {};
+    config.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+    config.auth = config.auth || {};
+    config.auth.profiles = config.auth.profiles || {};
+    config.auth.profiles['anthropic:default'] = { provider: 'anthropic', mode: 'api_key' };
+    config.agents = config.agents || {};
+    config.agents.defaults = config.agents.defaults || {};
+    config.agents.defaults.model = { primary: 'anthropic/claude-sonnet-4-5' };
+    config.agents.defaults.models = {
+        'anthropic/claude-sonnet-4-5': { alias: 'Sonnet 4.5' },
+        'anthropic/claude-opus-4-6': { alias: 'Opus 4.6' },
+        'anthropic/claude-haiku-4-5': { alias: 'Haiku 4.5' }
+    };
+    console.log('Anthropic configured: Claude Sonnet 4.5 (primary), Opus 4.6, Haiku 4.5');
+} else if (process.env.OPENROUTER_API_KEY) {
+    // OpenRouter configuration (fallback when no Anthropic key)
+    config.env = config.env || {};
+    config.env.OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+    config.auth = config.auth || {};
+    config.auth.profiles = config.auth.profiles || {};
+    config.auth.profiles['openrouter:default'] = { provider: 'openrouter', mode: 'api_key' };
+    config.agents = config.agents || {};
+    config.agents.defaults = config.agents.defaults || {};
+    config.agents.defaults.model = { primary: 'openrouter/anthropic/claude-sonnet-4-5' };
+    config.agents.defaults.models = {
+        'openrouter/anthropic/claude-sonnet-4-5': { alias: 'Sonnet 4.5' },
+        'openrouter/anthropic/claude-opus-4-6': { alias: 'Opus 4.6' },
+        'openrouter/anthropic/claude-haiku-4-5': { alias: 'Haiku 4.5' }
+    };
+    console.log('OpenRouter configured: Sonnet 4.5 (primary), Opus 4.6, Haiku 4.5');
+}
+
 // Telegram configuration
 // Overwrite entire channel object to drop stale keys from old R2 backups
 // that would fail OpenClaw's strict config validation (see #47)
+// mediaMaxMb: default 5 in OpenClaw; raise so larger files work (Telegram allows up to 50MB for documents)
 if (process.env.TELEGRAM_BOT_TOKEN) {
     const dmPolicy = process.env.TELEGRAM_DM_POLICY || 'pairing';
     config.channels.telegram = {
         botToken: process.env.TELEGRAM_BOT_TOKEN,
         enabled: true,
         dmPolicy: dmPolicy,
+        mediaMaxMb: 20,
     };
     if (process.env.TELEGRAM_DM_ALLOW_FROM) {
         config.channels.telegram.allowFrom = process.env.TELEGRAM_DM_ALLOW_FROM.split(',');
@@ -260,9 +299,43 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
     };
 }
 
+// Raise agent media limit (default 5MB); "File too large. Maximum size is 5MB" comes from agents.defaults.mediaMaxMb
+config.agents = config.agents || {};
+config.agents.defaults = config.agents.defaults || {};
+config.agents.defaults.mediaMaxMb = 20;
+
+// Disable skills that require system binaries not available in the sandbox (e.g. obsidian needs obsidian-cli/brew)
+config.skills = config.skills || {};
+config.skills.entries = config.skills.entries || {};
+config.skills.entries['obsidian'] = { enabled: false };
+
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('Configuration patched successfully');
 EOFPATCH
+
+# ============================================================
+# OPTIONAL: INSTALL EXTRA SKILLS FROM CLAWHUB (if not already present)
+# Verified slugs: resilient-coding-agent, openclaw-github-assistant,
+# openai-whisper-api, voice-wake-say (see https://clawhub.ai)
+# ============================================================
+if [ -x "$CLAWHUB_BIN" ]; then
+    echo "Checking ClawHub for extra skills..."
+    cd "$WORKSPACE_DIR"
+    export CLAWHUB_WORKDIR="$WORKSPACE_DIR"
+    for slug in resilient-coding-agent openclaw-github-assistant openai-whisper-api voice-wake-say; do
+        if [ ! -d "$SKILLS_DIR/$slug" ]; then
+            echo "Installing skill: $slug"
+            if "$CLAWHUB_BIN" install "$slug" --no-input --force 2>&1; then
+                echo "  OK: $slug installed"
+            else
+                echo "  (install $slug failed or not found, skipping)"
+            fi
+        else
+            echo "  (skill $slug already present, skipping)"
+        fi
+    done
+    cd - >/dev/null
+fi
 
 # ============================================================
 # BACKGROUND SYNC LOOP
@@ -322,8 +395,8 @@ echo "Dev mode: ${OPENCLAW_DEV_MODE:-false}"
 
 if [ -n "$OPENCLAW_GATEWAY_TOKEN" ]; then
     echo "Starting gateway with token auth..."
-    exec openclaw gateway --port 18789 --verbose --allow-unconfigured --bind lan --token "$OPENCLAW_GATEWAY_TOKEN"
+    exec "$OPENCLAW_BIN" gateway --port 18789 --verbose --allow-unconfigured --bind lan --token "$OPENCLAW_GATEWAY_TOKEN"
 else
     echo "Starting gateway with device pairing (no token)..."
-    exec openclaw gateway --port 18789 --verbose --allow-unconfigured --bind lan
+    exec "$OPENCLAW_BIN" gateway --port 18789 --verbose --allow-unconfigured --bind lan
 fi

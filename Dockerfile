@@ -1,9 +1,12 @@
 FROM docker.io/cloudflare/sandbox:0.7.0
 
-# Install Node.js 22 (required by OpenClaw) and rclone (for R2 persistence)
-# The base image has Node 20, we need to replace it with Node 22
-# Using direct binary download for reliability
-ENV NODE_VERSION=22.13.1
+# Install Node.js 22 (required by OpenClaw) and rclone (for R2 persistence).
+#
+# IMPORTANT: Do NOT replace the base image's system runtime in /usr/local.
+# Cloudflare's sandbox agent runs inside this image and expects the base layout.
+# We install Node 22 side-by-side and call it explicitly for OpenClaw.
+ENV NODE22_VERSION=22.13.1
+ENV NODE22_DIR=/opt/node22
 RUN ARCH="$(dpkg --print-architecture)" \
     && case "${ARCH}" in \
          amd64) NODE_ARCH="x64" ;; \
@@ -11,19 +14,20 @@ RUN ARCH="$(dpkg --print-architecture)" \
          *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;; \
        esac \
     && apt-get update && apt-get install -y xz-utils ca-certificates rclone \
-    && curl -fsSLk https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz -o /tmp/node.tar.xz \
-    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
-    && rm /tmp/node.tar.xz \
-    && node --version \
-    && npm --version
+    && mkdir -p "${NODE22_DIR}" \
+    && curl -fsSLk "https://nodejs.org/dist/v${NODE22_VERSION}/node-v${NODE22_VERSION}-linux-${NODE_ARCH}.tar.xz" -o /tmp/node22.tar.xz \
+    && tar -xJf /tmp/node22.tar.xz -C "${NODE22_DIR}" --strip-components=1 \
+    && rm /tmp/node22.tar.xz \
+    && "${NODE22_DIR}/bin/node" --version \
+    && "${NODE22_DIR}/bin/npm" --version
 
 # Install pnpm globally
-RUN npm install -g pnpm
+RUN PATH="${NODE22_DIR}/bin:${PATH}" "${NODE22_DIR}/bin/npm" install -g pnpm
 
-# Install OpenClaw (formerly clawdbot/moltbot)
+# Install OpenClaw (formerly clawdbot/moltbot) and ClawHub (skill registry CLI)
 # Pin to specific version for reproducible builds
-RUN npm install -g openclaw@2026.2.3 \
-    && openclaw --version
+RUN PATH="${NODE22_DIR}/bin:${PATH}" "${NODE22_DIR}/bin/npm" install -g openclaw@2026.2.3 clawhub \
+    && PATH="${NODE22_DIR}/bin:${PATH}" "${NODE22_DIR}/bin/openclaw" --version
 
 # Create OpenClaw directories
 # Legacy .clawdbot paths are kept for R2 backup migration

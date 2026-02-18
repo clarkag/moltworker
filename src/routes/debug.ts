@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { findExistingMoltbotProcess, waitForProcess } from '../gateway';
+import { buildEnvVars } from '../gateway/env';
 
 /**
  * Debug routes for inspecting container state
@@ -14,7 +15,9 @@ debug.get('/version', async (c) => {
   const sandbox = c.get('sandbox');
   try {
     // Get OpenClaw version
-    const versionProcess = await sandbox.startProcess('openclaw --version');
+    const versionProcess = await sandbox.startProcess(
+      "sh -c 'PATH=/opt/node22/bin:$PATH /opt/node22/bin/openclaw --version'",
+    );
     await new Promise((resolve) => setTimeout(resolve, 500));
     const versionLogs = await versionProcess.getLogs();
     const moltbotVersion = (versionLogs.stdout || versionLogs.stderr || '').trim();
@@ -128,7 +131,7 @@ debug.get('/gateway-api', async (c) => {
 // GET /debug/cli - Test OpenClaw CLI commands
 debug.get('/cli', async (c) => {
   const sandbox = c.get('sandbox');
-  const cmd = c.req.query('cmd') || 'openclaw --help';
+  const cmd = c.req.query('cmd') || "sh -c 'PATH=/opt/node22/bin:$PATH /opt/node22/bin/openclaw --help'";
 
   try {
     const proc = await sandbox.startProcess(cmd);
@@ -201,6 +204,39 @@ debug.get('/logs', async (c) => {
       },
       500,
     );
+  }
+});
+
+// GET /debug/openclaw-logs - Run `openclaw logs` in container (snapshot or follow), return output
+// Query: follow=1 runs --follow with 15s timeout; otherwise --no-follow --limit 300
+debug.get('/openclaw-logs', async (c) => {
+  const sandbox = c.get('sandbox');
+  if (!c.env.MOLTBOT_GATEWAY_TOKEN) {
+    return c.json({ error: 'MOLTBOT_GATEWAY_TOKEN not set' }, 500);
+  }
+  try {
+    const envVars = buildEnvVars(c.env);
+    const useFollow = c.req.query('follow') === '1';
+    const cmd = useFollow
+      ? `sh -c 'PATH=/opt/node22/bin:$PATH timeout 15 /opt/node22/bin/openclaw logs --follow --url ws://localhost:18789 --token "$OPENCLAW_GATEWAY_TOKEN" 2>&1'`
+      : `sh -c 'PATH=/opt/node22/bin:$PATH /opt/node22/bin/openclaw logs --no-follow --limit 300 --url ws://localhost:18789 --token "$OPENCLAW_GATEWAY_TOKEN" 2>&1'`;
+    const proc = await sandbox.startProcess(cmd, {
+      env: Object.keys(envVars).length > 0 ? envVars : undefined,
+    });
+    await waitForProcess(proc, useFollow ? 20000 : 10000);
+    const logs = await proc.getLogs();
+    const out = (logs.stdout || '').trim();
+    const err = (logs.stderr || '').trim();
+    return c.json({
+      status: 'ok',
+      exitCode: proc.exitCode,
+      stdout: out,
+      stderr: err,
+      combined: [out, err].filter(Boolean).join('\n'),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return c.json({ status: 'error', error: message }, 500);
   }
 });
 
@@ -342,6 +378,7 @@ debug.get('/env', async (c) => {
   return c.json({
     has_anthropic_key: !!c.env.ANTHROPIC_API_KEY,
     has_openai_key: !!c.env.OPENAI_API_KEY,
+    has_openrouter_key: !!c.env.OPENROUTER_API_KEY,
     has_gateway_token: !!c.env.MOLTBOT_GATEWAY_TOKEN,
     has_r2_access_key: !!c.env.R2_ACCESS_KEY_ID,
     has_r2_secret_key: !!c.env.R2_SECRET_ACCESS_KEY,

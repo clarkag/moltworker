@@ -26,7 +26,7 @@ import { getSandbox, Sandbox, type SandboxOptions } from '@cloudflare/sandbox';
 import type { AppEnv, MoltbotEnv } from './types';
 import { MOLTBOT_PORT } from './config';
 import { createAccessMiddleware } from './auth';
-import { ensureMoltbotGateway, findExistingMoltbotProcess } from './gateway';
+import { ensureMoltbotGateway, findExistingMoltbotProcess, kickMoltbotGateway } from './gateway';
 import { publicRoutes, api, adminUi, debug, cdp } from './routes';
 import { redactSensitiveParams } from './utils/logging';
 import loadingPageHtml from './assets/loading.html';
@@ -81,10 +81,11 @@ function validateRequiredEnv(env: MoltbotEnv): string[] {
   const hasLegacyGateway = !!(env.AI_GATEWAY_API_KEY && env.AI_GATEWAY_BASE_URL);
   const hasAnthropicKey = !!env.ANTHROPIC_API_KEY;
   const hasOpenAIKey = !!env.OPENAI_API_KEY;
+  const hasOpenRouterKey = !!env.OPENROUTER_API_KEY;
 
-  if (!hasCloudflareGateway && !hasLegacyGateway && !hasAnthropicKey && !hasOpenAIKey) {
+  if (!hasCloudflareGateway && !hasLegacyGateway && !hasAnthropicKey && !hasOpenAIKey && !hasOpenRouterKey) {
     missing.push(
-      'ANTHROPIC_API_KEY, OPENAI_API_KEY, or CLOUDFLARE_AI_GATEWAY_API_KEY + CF_AI_GATEWAY_ACCOUNT_ID + CF_AI_GATEWAY_GATEWAY_ID',
+      'ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or CLOUDFLARE_AI_GATEWAY_API_KEY + CF_AI_GATEWAY_ACCOUNT_ID + CF_AI_GATEWAY_GATEWAY_ID',
     );
   }
 
@@ -233,9 +234,54 @@ app.all('*', async (c) => {
 
   console.log('[PROXY] Handling request:', url.pathname);
 
-  // Check if gateway is already running
-  const existingProcess = await findExistingMoltbotProcess(sandbox);
-  const isGatewayReady = existingProcess !== null && existingProcess.status === 'running';
+  // Don't start the gateway for static/asset requests that don't need the app.
+  // Avoids "Network connection lost" and DO churn when the browser requests favicon etc.
+  const path = url.pathname;
+  if (
+    path === '/favicon.ico' ||
+    path === '/robots.txt' ||
+    path === '/apple-touch-icon.png' ||
+    path === '/favicon-32x32.png' ||
+    path === '/favicon-16x16.png'
+  ) {
+    return new Response(null, { status: 204 });
+  }
+
+  // Check if gateway is already running.
+  // Don't rely on the process status flag alone: we've observed cases where the
+  // gateway is reachable on the port but the Sandbox process remains "starting",
+  // which traps the UI on the loading page.
+  // IMPORTANT: Determine readiness without relying on process listing.
+  // listProcesses/createSession can be flaky and would cause a "ready -> redirect -> ready"
+  // loop if /api/status detects the gateway but / doesn't.
+  const probeGateway = async (timeoutMs: number): Promise<boolean> => {
+    try {
+      const url = `http://localhost:${MOLTBOT_PORT}/`;
+      const resp = await Promise.race([
+        sandbox.containerFetch(new Request(url), MOLTBOT_PORT),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('probe timeout')), timeoutMs),
+        ),
+      ]);
+      return !!resp;
+    } catch {
+      return false;
+    }
+  };
+
+  let isGatewayReady = await probeGateway(1200);
+  if (!isGatewayReady) {
+    // Best-effort: if probing fails, try process listing/port check (already time-boxed).
+    const existingProcess = await findExistingMoltbotProcess(sandbox);
+    if (existingProcess) {
+      try {
+        await existingProcess.waitForPort(MOLTBOT_PORT, { mode: 'tcp', timeout: 1500 });
+        isGatewayReady = true;
+      } catch {
+        isGatewayReady = false;
+      }
+    }
+  }
 
   // For browser requests (non-WebSocket, non-API), show loading page if gateway isn't ready
   const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
@@ -244,11 +290,10 @@ app.all('*', async (c) => {
   if (!isGatewayReady && !isWebSocketRequest && acceptsHtml) {
     console.log('[PROXY] Gateway not ready, serving loading page');
 
-    // Start the gateway in the background (don't await)
+    // Start the gateway in the background (don't await).
+    // Keep this background task fast to avoid waitUntil cancellation.
     c.executionCtx.waitUntil(
-      ensureMoltbotGateway(sandbox, c.env).catch((err: Error) => {
-        console.error('[PROXY] Background gateway start failed:', err);
-      }),
+      kickMoltbotGateway(sandbox, c.env),
     );
 
     // Return the loading page immediately
@@ -262,11 +307,31 @@ app.all('*', async (c) => {
     console.error('[PROXY] Failed to start Moltbot:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
+    // If this is a browser navigation and the failure is transient (common right after deploy
+    // when the DO is reset), serve the loading page so the UI can recover on its own.
+    if (
+      acceptsHtml &&
+      (errorMessage.includes('Durable Object reset because its code was updated') ||
+        errorMessage.includes('Network connection lost') ||
+        errorMessage.toLowerCase().includes('connection lost'))
+    ) {
+      c.executionCtx.waitUntil(kickMoltbotGateway(sandbox, c.env));
+      return c.html(loadingPageHtml, 503);
+    }
+
     let hint = 'Check worker logs with: wrangler tail';
     if (!c.env.ANTHROPIC_API_KEY) {
       hint = 'ANTHROPIC_API_KEY is not set. Run: wrangler secret put ANTHROPIC_API_KEY';
     } else if (errorMessage.includes('heap out of memory') || errorMessage.includes('OOM')) {
       hint = 'Gateway ran out of memory. Try again or check for memory leaks.';
+    } else if (
+      errorMessage.includes('Network connection lost') ||
+      errorMessage.includes('connection lost')
+    ) {
+      hint =
+        'Container connection was lost (e.g. after a deploy or DO reset). Try again in a few seconds or restart the gateway from /_admin/.';
+    } else if (errorMessage.includes('Durable Object reset because its code was updated')) {
+      hint = 'A deployment is in progress (Durable Object reset). Refresh in a few seconds.';
     }
 
     return c.json(
@@ -428,8 +493,34 @@ app.all('*', async (c) => {
     });
   }
 
+  // Inject gateway token into HTTP proxy requests if not already present.
+  // Cloudflare Access redirects can strip query params, so authenticated users can lose ?token=.
+  // Since the user already passed CF Access auth for this Worker route, we inject the token server-side.
+  let httpRequest = request;
+  if (c.env.MOLTBOT_GATEWAY_TOKEN && !url.searchParams.has('token')) {
+    const tokenUrl = new URL(url.toString());
+    tokenUrl.searchParams.set('token', c.env.MOLTBOT_GATEWAY_TOKEN);
+    httpRequest = new Request(tokenUrl.toString(), request);
+  }
+
   console.log('[HTTP] Proxying:', url.pathname + url.search);
-  const httpResponse = await sandbox.containerFetch(request, MOLTBOT_PORT);
+  const PROXY_TIMEOUT_MS = 30_000;
+  let httpResponse: Response;
+  try {
+    httpResponse = await Promise.race([
+      sandbox.containerFetch(httpRequest, MOLTBOT_PORT),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Gateway did not respond within ' + PROXY_TIMEOUT_MS / 1000 + 's')), PROXY_TIMEOUT_MS),
+      ),
+    ]);
+  } catch (proxyErr) {
+    const msg = proxyErr instanceof Error ? proxyErr.message : 'Proxy failed';
+    console.error('[HTTP] Proxy timeout or error:', msg);
+    return c.json(
+      { error: 'Gateway did not respond in time', details: msg, hint: 'Try again or restart the gateway from /_admin/' },
+      504,
+    );
+  }
   console.log('[HTTP] Response status:', httpResponse.status);
 
   // Add debug header to verify worker handled the request
@@ -446,4 +537,37 @@ app.all('*', async (c) => {
 
 export default {
   fetch: app.fetch,
+  // Some deployments may still have a cron trigger configured remotely.
+  // Use it as a lightweight watchdog to improve long-run stability.
+  scheduled: async (_event: ScheduledEvent, env: AppEnv['Bindings'], ctx: ExecutionContext) => {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const options = buildSandboxOptions(env);
+          const sandbox = getSandbox(env.Sandbox, 'moltbot', options);
+
+          // If the gateway isn't reachable, kick startup. Keep it fast/bounded.
+          const url = `http://localhost:${MOLTBOT_PORT}/`;
+          const ok = await Promise.race([
+            sandbox.containerFetch(
+              new Request(
+                env.MOLTBOT_GATEWAY_TOKEN
+                  ? url + `?token=${encodeURIComponent(env.MOLTBOT_GATEWAY_TOKEN)}`
+                  : url,
+              ),
+              MOLTBOT_PORT,
+            ),
+            new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1200)),
+          ]);
+
+          if (!ok) {
+            console.warn('[CRON] Gateway probe failed; kicking startup');
+            await kickMoltbotGateway(sandbox, env);
+          }
+        } catch (e) {
+          console.error('[CRON] Watchdog failed:', e);
+        }
+      })(),
+    );
+  },
 };

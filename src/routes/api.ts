@@ -40,7 +40,7 @@ adminApi.get('/devices', async (c) => {
     const token = c.env.MOLTBOT_GATEWAY_TOKEN;
     const tokenArg = token ? ` --token ${token}` : '';
     const proc = await sandbox.startProcess(
-      `openclaw devices list --json --url ws://localhost:18789${tokenArg}`,
+      `sh -c 'PATH=/opt/node22/bin:$PATH /opt/node22/bin/openclaw devices list --json --url ws://localhost:18789${tokenArg} 2>&1'`,
     );
     await waitForProcess(proc, CLI_TIMEOUT_MS);
 
@@ -96,7 +96,7 @@ adminApi.post('/devices/:requestId/approve', async (c) => {
     const token = c.env.MOLTBOT_GATEWAY_TOKEN;
     const tokenArg = token ? ` --token ${token}` : '';
     const proc = await sandbox.startProcess(
-      `openclaw devices approve ${requestId} --url ws://localhost:18789${tokenArg}`,
+      `sh -c 'PATH=/opt/node22/bin:$PATH /opt/node22/bin/openclaw devices approve ${requestId} --url ws://localhost:18789${tokenArg} 2>&1'`,
     );
     await waitForProcess(proc, CLI_TIMEOUT_MS);
 
@@ -132,7 +132,7 @@ adminApi.post('/devices/approve-all', async (c) => {
     const token = c.env.MOLTBOT_GATEWAY_TOKEN;
     const tokenArg = token ? ` --token ${token}` : '';
     const listProc = await sandbox.startProcess(
-      `openclaw devices list --json --url ws://localhost:18789${tokenArg}`,
+      `sh -c 'PATH=/opt/node22/bin:$PATH /opt/node22/bin/openclaw devices list --json --url ws://localhost:18789${tokenArg} 2>&1'`,
     );
     await waitForProcess(listProc, CLI_TIMEOUT_MS);
 
@@ -162,7 +162,7 @@ adminApi.post('/devices/approve-all', async (c) => {
       try {
         // eslint-disable-next-line no-await-in-loop -- sequential device approval required
         const approveProc = await sandbox.startProcess(
-          `openclaw devices approve ${device.requestId} --url ws://localhost:18789${tokenArg}`,
+          `sh -c 'PATH=/opt/node22/bin:$PATH /opt/node22/bin/openclaw devices approve ${device.requestId} --url ws://localhost:18789${tokenArg} 2>&1'`,
         );
         // eslint-disable-next-line no-await-in-loop
         await waitForProcess(approveProc, CLI_TIMEOUT_MS);
