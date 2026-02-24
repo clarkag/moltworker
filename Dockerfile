@@ -25,8 +25,8 @@ RUN ARCH="$(dpkg --print-architecture)" \
 RUN PATH="${NODE22_DIR}/bin:${PATH}" "${NODE22_DIR}/bin/npm" install -g pnpm
 
 # Install OpenClaw (formerly clawdbot/moltbot) and ClawHub (skill registry CLI)
-# Pin to specific version for reproducible builds
-RUN PATH="${NODE22_DIR}/bin:${PATH}" "${NODE22_DIR}/bin/npm" install -g openclaw@2026.2.3 clawhub \
+# Use latest stable OpenClaw so new models (e.g. claude-sonnet-4.6) are available.
+RUN PATH="${NODE22_DIR}/bin:${PATH}" "${NODE22_DIR}/bin/npm" install -g openclaw@latest clawhub \
     && PATH="${NODE22_DIR}/bin:${PATH}" "${NODE22_DIR}/bin/openclaw" --version
 
 # Create OpenClaw directories

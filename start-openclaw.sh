@@ -395,8 +395,9 @@ echo "Dev mode: ${OPENCLAW_DEV_MODE:-false}"
 
 if [ -n "$OPENCLAW_GATEWAY_TOKEN" ]; then
     echo "Starting gateway with token auth..."
-    exec "$OPENCLAW_BIN" gateway --port 18789 --verbose --allow-unconfigured --bind lan --token "$OPENCLAW_GATEWAY_TOKEN"
+    # OpenClaw 2026.2.x+ requires the `run` subcommand to actually start the gateway.
+    exec "$OPENCLAW_BIN" gateway run --port 18789 --verbose --allow-unconfigured --bind lan --token "$OPENCLAW_GATEWAY_TOKEN"
 else
     echo "Starting gateway with device pairing (no token)..."
-    exec "$OPENCLAW_BIN" gateway --port 18789 --verbose --allow-unconfigured --bind lan
+    exec "$OPENCLAW_BIN" gateway run --port 18789 --verbose --allow-unconfigured --bind lan
 fi
