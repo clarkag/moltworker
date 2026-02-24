@@ -267,7 +267,22 @@ app.all('*', async (c) => {
           setTimeout(() => reject(new Error('probe timeout')), timeoutMs),
         ),
       ]);
-      return !!resp;
+      if (!resp) return false;
+
+      // When the container isn't listening on the target port, Sandbox often returns an
+      // HTTP 500 response instead of throwing. Treat that as NOT ready so we don't try
+      // to proxy WS/HTTP and surface "container not listening" to users.
+      if (resp.status >= 500) {
+        const body = await resp.clone().text().catch(() => '');
+        if (
+          body.toLowerCase().includes('not listening') ||
+          body.toLowerCase().includes('error proxying request to container')
+        ) {
+          return false;
+        }
+      }
+
+      return true;
     } catch {
       return false;
     }

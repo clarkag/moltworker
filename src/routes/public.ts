@@ -51,8 +51,21 @@ publicRoutes.get('/api/status', async (c) => {
           setTimeout(() => reject(new Error('probe timeout')), timeoutMs),
         ),
       ]);
-      // Any HTTP response means something is listening on the port.
-      return !!resp;
+      if (!resp) return false;
+
+      // Sandbox may return HTTP 500 instead of throwing when the port isn't listening.
+      if (resp.status >= 500) {
+        const body = await resp.clone().text().catch(() => '');
+        if (
+          body.toLowerCase().includes('not listening') ||
+          body.toLowerCase().includes('error proxying request to container')
+        ) {
+          return false;
+        }
+      }
+
+      // Any other HTTP response means something is listening on the port.
+      return true;
     } catch {
       return false;
     }
