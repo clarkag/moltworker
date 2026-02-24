@@ -289,7 +289,12 @@ app.all('*', async (c) => {
 
   // For browser requests (non-WebSocket, non-API), show loading page if gateway isn't ready
   const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
-  const acceptsHtml = request.headers.get('Accept')?.includes('text/html');
+  // Don't rely on Accept alone; some browsers/proxies send */* for navigations.
+  // Sec-Fetch-* headers are the most reliable signal for real navigations.
+  const acceptsHtml =
+    request.headers.get('Accept')?.includes('text/html') ||
+    request.headers.get('Sec-Fetch-Dest') === 'document' ||
+    request.headers.get('Sec-Fetch-Mode') === 'navigate';
 
   if (!isGatewayReady && !isWebSocketRequest && acceptsHtml) {
     console.log('[PROXY] Gateway not ready, serving loading page');
@@ -302,6 +307,16 @@ app.all('*', async (c) => {
 
     // Return the loading page immediately
     return c.html(loadingPageHtml);
+  }
+
+  // If this is a WebSocket upgrade but the gateway isn't listening yet, don't attempt
+  // wsConnect (it will 500 with "container not listening"). Kick startup and ask client to retry.
+  if (!isGatewayReady && isWebSocketRequest) {
+    c.executionCtx.waitUntil(kickMoltbotGateway(sandbox, c.env));
+    return new Response('Gateway starting; retry shortly', {
+      status: 503,
+      headers: { 'Retry-After': '2' },
+    });
   }
 
   // Ensure moltbot is running (this will wait for startup).
